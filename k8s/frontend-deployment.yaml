@@ -1,0 +1,88 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailarchive-frontend
+  namespace: mailarchive
+  labels:
+    app: mailarchive
+    component: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mailarchive
+      component: frontend
+  template:
+    metadata:
+      labels:
+        app: mailarchive
+        component: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: your-registry/mailarchive-frontend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 3
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailarchive-frontend
+  namespace: mailarchive
+  labels:
+    app: mailarchive
+    component: frontend
+spec:
+  selector:
+    app: mailarchive
+    component: frontend
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+  type: ClusterIP
+---
+# Adjust host to your ingress setup - uses your existing ingress controller
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mailarchive-ingress
+  namespace: mailarchive
+  labels:
+    app: mailarchive
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mail.home  # Change to your preferred hostname
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mailarchive-frontend
+                port:
+                  number: 80

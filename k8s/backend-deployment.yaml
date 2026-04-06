@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailarchive-backend
+  namespace: mailarchive
+  labels:
+    app: mailarchive
+    component: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mailarchive
+      component: backend
+  strategy:
+    type: Recreate  # Required: only one pod can hold the RWO PVC
+  template:
+    metadata:
+      labels:
+        app: mailarchive
+        component: backend
+    spec:
+      containers:
+        - name: backend
+          image: your-registry/mailarchive-backend:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: IMAP_HOST
+              value: "imap.gmail.com"
+            - name: IMAP_PORT
+              value: "993"
+            - name: MAIL_ROOT
+              value: "/mail"
+            - name: SYNC_INTERVAL_HOURS
+              value: "24"
+            - name: IMAP_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mailarchive-secret
+                  key: IMAP_USER
+            - name: IMAP_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: mailarchive-secret
+                  key: IMAP_PASS
+          volumeMounts:
+            - name: mail-storage
+              mountPath: /mail
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: mail-storage
+          persistentVolumeClaim:
+            claimName: mailarchive-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mailarchive-backend
+  namespace: mailarchive
+  labels:
+    app: mailarchive
+    component: backend
+spec:
+  selector:
+    app: mailarchive
+    component: backend
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+  type: ClusterIP
