@@ -4,6 +4,7 @@ import imaplib
 import email
 import hashlib
 import logging
+import base64
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -28,6 +29,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# In-memory cache: folder_name -> {"emails": [...], "built_at": datetime}
+_email_cache: dict = {}
+
+def invalidate_cache(folder_name: str = None):
+    """Invalidate cache for a specific folder, or all folders if None."""
+    global _email_cache
+    if folder_name:
+        _email_cache.pop(folder_name, None)
+        logger.info(f"Cache invalidated for folder: {folder_name}")
+    else:
+        _email_cache.clear()
+        logger.info("Full email cache invalidated")
+
 # Config from env
 IMAP_HOST = os.getenv("IMAP_HOST", "imap.gmail.com")
 IMAP_PORT = int(os.getenv("IMAP_PORT", "993"))
@@ -39,16 +53,11 @@ SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "24"))
 
 GMAIL_LABELS = [
     "INBOX",
-    "Amazon",
-    "Apple", 
-    "Cinema Tickets",
-    "Ebay & Paypal", 
-    "Eshopping", 
-    "Fitness", 
-    "Friends & Family",
-    "Gaming", 
-    "General Mail", 
-    "Travel & Holidays",
+    "Amazon", "Apple", "Cinema Tickets", "Divorce",
+    "Ebay & Paypal", "Eshopping", "Fitness", "Friends & Family",
+    "From Carolyn", "From Nicky", "Gaming", "General Mail",
+    "House Pet & Car Stuff", "Job Stuff", "Notes", "Photography",
+    "Politics", "Shirelands", "Travel & Holidays"
 ]
 
 sync_status = {
@@ -86,11 +95,32 @@ def label_to_folder(label: str) -> str:
     return label.replace("/", "_").strip()
 
 
-def folder_to_imap(label: str) -> str:
-    """Convert label to IMAP folder name (Gmail uses [Gmail]/ prefix for specials)."""
+def encode_imap_utf7(label: str) -> str:
+    """Encode a label name to IMAP modified UTF-7 as required by RFC 3501.
+    Gmail encodes special characters (& etc) using this scheme."""
     if label == "INBOX":
         return "INBOX"
-    return f'"{label}"'
+    result = []
+    i = 0
+    while i < len(label):
+        c = label[i]
+        if 0x20 <= ord(c) <= 0x7e and c != '&':
+            result.append(c)
+        else:
+            # Encode non-ASCII or & in modified UTF-7
+            encoded = c.encode("utf-16-be")
+            b64 = base64.b64encode(encoded).decode("ascii").rstrip("=")
+            result.append(f"&{b64}-")
+        i += 1
+    return "".join(result)
+
+
+def folder_to_imap(label: str) -> str:
+    """Convert label to quoted IMAP folder name with modified UTF-7 encoding."""
+    if label == "INBOX":
+        return "INBOX"
+    encoded = encode_imap_utf7(label)
+    return f'"{encoded}"'
 
 
 def get_eml_filename(uid: str, msg_id: str) -> str:
@@ -180,6 +210,8 @@ def run_sync():
             total += count
             sync_status["folders_synced"] += 1
             save_state(state)
+            if count > 0:
+                invalidate_cache(label_to_folder(label))
 
         imap.logout()
         sync_status["emails_downloaded"] = total
@@ -219,16 +251,25 @@ def list_folders():
 
 
 @app.get("/api/emails/{folder}")
-def list_emails(folder: str, skip: int = 0, limit: int = 100):
+def list_emails(folder: str, skip: int = 0, limit: int = 5000):
     folder_path = MAIL_ROOT / folder
     if not folder_path.exists():
         raise HTTPException(status_code=404, detail="Folder not found")
 
+    # Serve from cache if available
+    if folder in _email_cache:
+        cached = _email_cache[folder]
+        total = len(cached)
+        return {"total": total, "emails": cached[skip:skip + limit], "cached": True}
+
+    # Build the list by reading email headers from disk
     emails = []
-    for eml_file in sorted(folder_path.glob("*.eml"), reverse=True):
+    for eml_file in folder_path.glob("*.eml"):
         try:
             with open(eml_file, "rb") as f:
-                msg = email.message_from_bytes(f.read())
+                # Only read first 8KB — enough to get headers without loading full body
+                raw = f.read(8192)
+            msg = email.message_from_bytes(raw)
 
             date_str = msg.get("Date", "")
             try:
@@ -248,10 +289,67 @@ def list_emails(folder: str, skip: int = 0, limit: int = 100):
         except Exception as e:
             logger.warning(f"Error reading {eml_file}: {e}")
 
-    # Sort by date descending
+    # Sort by date descending and store in cache
     emails.sort(key=lambda x: x["date"], reverse=True)
+    _email_cache[folder] = emails
+    logger.info(f"Cache built for folder '{folder}': {len(emails)} emails")
+
     total = len(emails)
-    return {"total": total, "emails": emails[skip:skip + limit]}
+    return {"total": total, "emails": emails[skip:skip + limit], "cached": False}
+
+
+@app.get("/api/email/{folder}/{filename}/download")
+def download_email(folder: str, filename: str):
+    """Download an individual email as a .eml file."""
+    eml_path = MAIL_ROOT / folder / filename
+    if not eml_path.exists():
+        raise HTTPException(status_code=404, detail="Email not found")
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path=eml_path,
+        media_type="message/rfc822",
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/sync/folder/{folder_name}")
+def sync_single_folder(folder_name: str, background_tasks: BackgroundTasks):
+    """Trigger an immediate sync of a single folder by its filesystem name."""
+    # Find the matching label
+    label = next(
+        (l for l in GMAIL_LABELS if label_to_folder(l) == folder_name),
+        None
+    )
+    if label is None:
+        raise HTTPException(status_code=404, detail=f"Folder '{folder_name}' not found")
+    if sync_status["running"]:
+        raise HTTPException(status_code=409, detail="A full sync is already running")
+
+    def _sync_one():
+        global sync_status
+        sync_status["running"] = True
+        sync_status["last_run"] = datetime.utcnow().isoformat()
+        try:
+            imap = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+            imap.login(IMAP_USER, IMAP_PASS)
+            state = load_state()
+            count = sync_folder(imap, label, state)
+            save_state(state)
+            imap.logout()
+            if count > 0:
+                invalidate_cache(label_to_folder(label))
+            sync_status["emails_downloaded"] = count
+            sync_status["last_result"] = f"success (folder: {label})"
+            logger.info(f"Single folder sync complete: {label}, {count} emails")
+        except Exception as e:
+            sync_status["last_result"] = f"error: {str(e)}"
+            logger.error(f"Single folder sync failed: {e}")
+        finally:
+            sync_status["running"] = False
+
+    background_tasks.add_task(_sync_one)
+    return {"message": f"Sync started for folder: {label}"}
 
 
 @app.get("/api/email/{folder}/{filename}")

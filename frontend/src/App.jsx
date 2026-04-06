@@ -50,13 +50,13 @@ function SyncBar({ status, onSync }) {
   );
 }
 
-function FolderPane({ folders, selected, onSelect }) {
+function FolderPane({ folders, selected, onSelect, onSyncFolder, syncingFolder }) {
   return (
     <div className="folder-pane">
       <div className="pane-header">Folders</div>
       <div className="folder-list">
         {folders.map((f) => (
-          <button
+          <div
             key={f.folder}
             className={`folder-item ${selected === f.folder ? "active" : ""}`}
             onClick={() => onSelect(f)}
@@ -68,19 +68,51 @@ function FolderPane({ folders, selected, onSelect }) {
             {f.count > 0 && (
               <span className="folder-count">{f.count.toLocaleString()}</span>
             )}
-          </button>
+            <button
+              className={`folder-sync-btn ${syncingFolder === f.folder ? "spinning" : ""}`}
+              title={`Sync ${f.name} now`}
+              onClick={(e) => { e.stopPropagation(); onSyncFolder(f); }}
+              disabled={!!syncingFolder}
+            >⟳</button>
+          </div>
         ))}
       </div>
     </div>
   );
 }
 
+const ITEM_HEIGHT = 56; // px — must match CSS
+const OVERSCAN = 10;   // extra rows rendered above/below viewport
+
 function EmailList({ emails, total, selected, onSelect, loading, folder }) {
   const listRef = useRef(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [listHeight, setListHeight] = useState(400);
 
+  // Reset scroll when folder changes
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = 0;
+    setScrollTop(0);
   }, [folder]);
+
+  // Measure container height
+  useEffect(() => {
+    if (!listRef.current) return;
+    const ro = new ResizeObserver(([entry]) => {
+      setListHeight(entry.contentRect.height);
+    });
+    ro.observe(listRef.current);
+    return () => ro.disconnect();
+  }, []);
+
+  const handleScroll = (e) => setScrollTop(e.currentTarget.scrollTop);
+
+  const totalHeight = emails.length * ITEM_HEIGHT;
+  const startIndex = Math.max(0, Math.floor(scrollTop / ITEM_HEIGHT) - OVERSCAN);
+  const visibleCount = Math.ceil(listHeight / ITEM_HEIGHT) + OVERSCAN * 2;
+  const endIndex = Math.min(emails.length, startIndex + visibleCount);
+  const visibleEmails = emails.slice(startIndex, endIndex);
+  const offsetY = startIndex * ITEM_HEIGHT;
 
   return (
     <div className="email-list-pane">
@@ -89,24 +121,31 @@ function EmailList({ emails, total, selected, onSelect, loading, folder }) {
           <>{folder} <span className="count-badge">{total.toLocaleString()}</span></>
         ) : "Emails"}
       </div>
-      <div className="email-list" ref={listRef}>
+      <div className="email-list" ref={listRef} onScroll={handleScroll}>
         {loading && <div className="loading-state">Loading…</div>}
         {!loading && emails.length === 0 && (
           <div className="empty-state">No emails in this folder</div>
         )}
-        {emails.map((e) => (
-          <button
-            key={e.id}
-            className={`email-item ${selected?.id === e.id ? "active" : ""}`}
-            onClick={() => onSelect(e)}
-          >
-            <div className="email-item-top">
-              <span className="email-from">{formatFromName(e.from)}</span>
-              <span className="email-date">{formatDate(e.date)}</span>
+        {!loading && emails.length > 0 && (
+          <div style={{ height: totalHeight, position: "relative" }}>
+            <div style={{ position: "absolute", top: offsetY, left: 0, right: 0 }}>
+              {visibleEmails.map((e) => (
+                <div
+                  key={e.id}
+                  className={`email-item ${selected?.id === e.id ? "active" : ""}`}
+                  style={{ height: ITEM_HEIGHT }}
+                  onClick={() => onSelect(e)}
+                >
+                  <div className="email-item-top">
+                    <span className="email-from">{formatFromName(e.from)}</span>
+                    <span className="email-date">{formatDate(e.date)}</span>
+                  </div>
+                  <div className="email-subject">{e.subject}</div>
+                </div>
+              ))}
             </div>
-            <div className="email-subject">{e.subject}</div>
-          </button>
-        ))}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -154,7 +193,15 @@ function EmailDetail({ email: em, folder, loading }) {
   return (
     <div className="email-detail-pane">
       <div className="detail-header">
-        <div className="detail-subject">{em.subject}</div>
+        <div className="detail-header-top">
+          <div className="detail-subject">{em.subject}</div>
+          <a
+            className="download-btn"
+            href={`${API}/email/${folder.folder}/${em.id}.eml/download`}
+            download={`${em.id}.eml`}
+            title="Download .eml file"
+          >⬇ Export .eml</a>
+        </div>
         <div className="detail-meta">
           <div className="meta-row"><span className="meta-label">From</span><span className="meta-value">{em.from}</span></div>
           <div className="meta-row"><span className="meta-label">To</span><span className="meta-value">{em.to}</span></div>
@@ -200,18 +247,22 @@ export default function App() {
   const [status, setStatus] = useState(null);
   const [listLoading, setListLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [syncingFolder, setSyncingFolder] = useState(null);
+
+  const selectedFolderRef = useRef(null);
 
   const fetchFolders = useCallback(async () => {
     try {
       const res = await fetch(`${API}/folders`);
       const data = await res.json();
       setFolders(data);
-      if (!selectedFolder && data.length > 0) {
+      if (!selectedFolderRef.current && data.length > 0) {
         const inbox = data.find(f => f.folder === "INBOX") || data[0];
         setSelectedFolder(inbox);
+        selectedFolderRef.current = inbox;
       }
     } catch (e) { console.error("Folders fetch failed", e); }
-  }, [selectedFolder]);
+  }, []);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -221,26 +272,43 @@ export default function App() {
     } catch (e) { console.error("Status fetch failed", e); }
   }, []);
 
+  const fetchAbortRef = useRef(null);
+
   const fetchEmails = useCallback(async (folder) => {
     if (!folder) return;
+
+    // Cancel any in-flight request for a previous folder
+    if (fetchAbortRef.current) {
+      fetchAbortRef.current.abort();
+    }
+    const controller = new AbortController();
+    fetchAbortRef.current = controller;
+
     setListLoading(true);
     setEmails([]);
+    setTotalEmails(0);
     setSelectedEmail(null);
     setEmailDetail(null);
+
     try {
-      const res = await fetch(`${API}/emails/${folder.folder}?limit=200`);
+      const res = await fetch(`${API}/emails/${encodeURIComponent(folder.folder)}?limit=5000`, {
+        signal: controller.signal,
+      });
       const data = await res.json();
       setEmails(data.emails || []);
       setTotalEmails(data.total || 0);
-    } catch (e) { console.error("Email list fetch failed", e); }
-    finally { setListLoading(false); }
+    } catch (e) {
+      if (e.name !== "AbortError") console.error("Email list fetch failed", e);
+    } finally {
+      setListLoading(false);
+    }
   }, []);
 
   const fetchEmailDetail = useCallback(async (folder, em) => {
     setDetailLoading(true);
     setEmailDetail(null);
     try {
-      const res = await fetch(`${API}/email/${folder.folder}/${em.filename}`);
+      const res = await fetch(`${API}/email/${encodeURIComponent(folder.folder)}/${encodeURIComponent(em.filename)}`);
       const data = await res.json();
       setEmailDetail(data);
     } catch (e) { console.error("Email detail fetch failed", e); }
@@ -254,8 +322,31 @@ export default function App() {
     } catch (e) { console.error("Sync trigger failed", e); }
   };
 
+  const handleSyncFolder = async (folder) => {
+    setSyncingFolder(folder.folder);
+    try {
+      await fetch(`${API}/sync/folder/${folder.folder}`, { method: "POST" });
+      // Poll until done then refresh folder counts
+      const poll = setInterval(async () => {
+        const res = await fetch(`${API}/status`);
+        const s = await res.json();
+        setStatus(s);
+        if (!s.running) {
+          clearInterval(poll);
+          setSyncingFolder(null);
+          fetchFolders();
+          if (selectedFolder?.folder === folder.folder) fetchEmails(folder);
+        }
+      }, 2000);
+    } catch (e) {
+      console.error("Folder sync failed", e);
+      setSyncingFolder(null);
+    }
+  };
+
   const handleFolderSelect = (folder) => {
     setSelectedFolder(folder);
+    selectedFolderRef.current = folder;
     fetchEmails(folder);
   };
 
@@ -265,7 +356,6 @@ export default function App() {
   };
 
   useEffect(() => { fetchFolders(); fetchStatus(); }, []);
-  useEffect(() => { if (selectedFolder) fetchEmails(selectedFolder); }, [selectedFolder?.folder]);
 
   // Poll status while syncing
   useEffect(() => {
@@ -411,7 +501,7 @@ export default function App() {
 
         /* Folder pane */
         .folder-pane {
-          width: 220px;
+          width: 270px;
           flex-shrink: 0;
           border-right: 1px solid var(--border);
           display: flex;
@@ -445,11 +535,60 @@ export default function App() {
           border-left: 2px solid transparent;
         }
         .folder-item:hover { background: var(--hover-bg); color: var(--text); }
+        .folder-item:hover .folder-sync-btn { opacity: 1; }
         .folder-item.active {
           background: var(--active-bg);
           color: var(--text);
           border-left-color: var(--accent);
         }
+        .folder-sync-btn {
+          margin-left: auto;
+          background: none;
+          border: 1px solid var(--border);
+          border-radius: 4px;
+          color: var(--text-muted);
+          font-size: 12px;
+          width: 20px;
+          height: 20px;
+          cursor: pointer;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          opacity: 0;
+          transition: opacity 0.15s, color 0.15s, border-color 0.15s;
+          flex-shrink: 0;
+          padding: 0;
+          line-height: 1;
+        }
+        .folder-sync-btn:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+        .folder-sync-btn:disabled { cursor: not-allowed; }
+        .folder-sync-btn.spinning { opacity: 1; color: var(--success); animation: spin 1s linear infinite; }
+        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+        .detail-header-top {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 12px;
+        }
+        .download-btn {
+          background: var(--surface3);
+          border: 1px solid var(--border);
+          border-radius: var(--radius);
+          color: var(--text-dim);
+          font-size: 11px;
+          font-family: var(--font-sans);
+          padding: 4px 10px;
+          cursor: pointer;
+          white-space: nowrap;
+          text-decoration: none;
+          flex-shrink: 0;
+          transition: color 0.15s, border-color 0.15s;
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+        }
+        .download-btn:hover { color: var(--accent); border-color: var(--accent); }
         .folder-icon { font-size: 13px; flex-shrink: 0; }
         .folder-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .folder-count {
@@ -471,7 +610,7 @@ export default function App() {
         .email-list {
           flex: 1;
           overflow-y: auto;
-          padding: 4px 0;
+          padding: 0;
         }
         .email-list::-webkit-scrollbar { width: 4px; }
         .email-list::-webkit-scrollbar-track { background: transparent; }
@@ -494,11 +633,14 @@ export default function App() {
           cursor: pointer;
           display: flex;
           flex-direction: column;
+          justify-content: center;
           gap: 3px;
           font-family: var(--font-sans);
           border-bottom: 1px solid var(--border);
           transition: background 0.1s;
           border-left: 2px solid transparent;
+          box-sizing: border-box;
+          overflow: hidden;
         }
         .email-item:hover { background: var(--hover-bg); }
         .email-item.active {
@@ -635,6 +777,8 @@ export default function App() {
               folders={folders}
               selected={selectedFolder?.folder}
               onSelect={handleFolderSelect}
+              onSyncFolder={handleSyncFolder}
+              syncingFolder={syncingFolder}
             />
             <EmailList
               emails={emails}
