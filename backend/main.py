@@ -39,11 +39,16 @@ SYNC_INTERVAL_HOURS = int(os.getenv("SYNC_INTERVAL_HOURS", "24"))
 
 GMAIL_LABELS = [
     "INBOX",
-    "Amazon", "Apple", "Cinema Tickets", "Divorce",
-    "Ebay & Paypal", "Eshopping", "Fitness", "Friends & Family",
-    "From Carolyn", "From Nicky", "Gaming", "General Mail",
-    "House Pet & Car Stuff", "Job Stuff", "Notes", "Photography",
-    "Politics", "Shirelands", "Travel & Holidays"
+    "Amazon",
+    "Apple", 
+    "Cinema Tickets",
+    "Ebay & Paypal", 
+    "Eshopping", 
+    "Fitness", 
+    "Friends & Family",
+    "Gaming", 
+    "General Mail", 
+    "Travel & Holidays",
 ]
 
 sync_status = {
