@@ -350,6 +350,47 @@ def sync_folder(imap: imaplib.IMAP4_SSL, label: str, state: dict) -> int:
         logger.warning(f"Error selecting folder {label}: {e}")
         return 0
 
+    # --- Reconciliation: fetch ALL current UIDs from IMAP and remove
+    # any local .eml files whose UID is no longer present in this folder.
+    # This handles emails moved or deleted in Gmail since last sync.
+    status, all_data = imap.search(None, "ALL")
+    if status == "OK" and all_data[0]:
+        imap_uids = set(uid.decode() for uid in all_data[0].split())
+    else:
+        imap_uids = set()
+
+    removed = 0
+    removed_filenames = set()
+    for eml_file in list(folder_path.glob("*.eml")):
+        # Filename format is {uid}_{hash}.eml — extract the UID prefix
+        uid_part = eml_file.stem.split("_")[0]
+        if uid_part not in imap_uids:
+            try:
+                eml_file.unlink()
+                removed_filenames.add(eml_file.name)
+                removed += 1
+                logger.info(f"Removed {label}/{eml_file.name} (no longer in IMAP folder)")
+            except Exception as e:
+                logger.warning(f"Could not remove {eml_file}: {e}")
+
+    # If any files were removed, update the cache to reflect this
+    if removed_filenames:
+        existing = _email_cache.get(folder_name) or _load_cache_from_disk(folder_name) or []
+        pruned = [e for e in existing if e["filename"] not in removed_filenames]
+        _email_cache[folder_name] = pruned
+        _save_cache_to_disk(folder_name, pruned)
+        logger.info(f"Cache pruned for '{folder_name}': removed {removed} entries")
+
+    # Also remove from search index
+    if removed_filenames:
+        ix = get_index()
+        with _index_lock:
+            writer = AsyncWriter(ix)
+            for fname in removed_filenames:
+                doc_id = f"{folder_name}/{fname}"
+                writer.delete_by_term("doc_id", doc_id)
+            writer.commit()
+
     last_uid = state.get(label, "0")
     if last_uid == "0":
         status, data = imap.search(None, "ALL")
@@ -357,6 +398,8 @@ def sync_folder(imap: imaplib.IMAP4_SSL, label: str, state: dict) -> int:
         status, data = imap.search(None, f"UID {int(last_uid)+1}:*")
 
     if status != "OK" or not data[0]:
+        if removed:
+            state[label] = str(max(imap_uids, key=int)) if imap_uids else "0"
         return 0
 
     uids = data[0].split()
@@ -366,6 +409,7 @@ def sync_folder(imap: imaplib.IMAP4_SSL, label: str, state: dict) -> int:
     downloaded  = 0
     max_uid     = int(last_uid)
     new_paths   = []
+    new_entries = []
 
     for uid in uids:
         uid_str = uid.decode()
@@ -386,13 +430,35 @@ def sync_folder(imap: imaplib.IMAP4_SSL, label: str, state: dict) -> int:
                 downloaded += 1
                 logger.info(f"Downloaded {label}/{filename}")
 
+                date_str = msg.get("Date", "")
+                try:
+                    parsed_date = email.utils.parsedate_to_datetime(date_str)
+                    iso_date = parsed_date.isoformat()
+                except Exception:
+                    iso_date = date_str
+                new_entries.append({
+                    "id":       eml_path.stem,
+                    "filename": eml_path.name,
+                    "from":     decode_str(msg.get("From", "")),
+                    "subject":  decode_str(msg.get("Subject", "(No Subject)")),
+                    "date":     iso_date,
+                    "date_raw": date_str,
+                })
+
             max_uid = max(max_uid, int(uid_str))
         except Exception as e:
             logger.error(f"Error fetching UID {uid_str} from {label}: {e}")
 
     state[label] = str(max_uid)
 
-    # Index newly downloaded emails
+    if new_entries:
+        existing = _email_cache.get(folder_name) or _load_cache_from_disk(folder_name) or []
+        merged = existing + new_entries
+        merged.sort(key=lambda x: x["date"], reverse=True)
+        _email_cache[folder_name] = merged
+        _save_cache_to_disk(folder_name, merged)
+        logger.info(f"Cache updated for '{folder_name}': +{len(new_entries)} emails ({len(merged)} total)")
+
     if new_paths:
         index_new_emails(folder_name, new_paths)
 
@@ -421,8 +487,6 @@ def run_sync():
             total += count
             sync_status["folders_synced"] += 1
             save_state(state)
-            if count > 0:
-                invalidate_cache(label_to_folder(label))
 
         imap.logout()
         sync_status["emails_downloaded"] = total
@@ -471,8 +535,6 @@ def sync_single_folder(folder_name: str, background_tasks: BackgroundTasks):
             count = sync_folder(imap, label, state)
             save_state(state)
             imap.logout()
-            if count > 0:
-                invalidate_cache(label_to_folder(label))
             sync_status["emails_downloaded"] = count
             sync_status["last_result"] = f"success (folder: {label})"
             logger.info(f"Single folder sync complete: {label}, {count} emails")

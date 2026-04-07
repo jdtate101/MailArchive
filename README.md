@@ -1,8 +1,8 @@
-# MailArchive
+# MailArchive v2
 
 A self-hosted Gmail archiver that syncs emails via IMAP to `.eml` files on a PVC, with a three-pane web UI. Runs on any Kubernetes cluster with persistent storage.
 
-## What's New
+## What's New in v2
 
 - **Full-text search** across all folders using a Whoosh index — searches subject, from, to, and body with relevance ranking and body snippets
 - **Attachment download** — click any attachment chip in the email detail pane to open or download it directly
